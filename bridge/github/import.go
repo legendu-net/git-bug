@@ -10,6 +10,8 @@ import (
 	"github.com/git-bug/git-bug/bridge/core"
 	"github.com/git-bug/git-bug/bridge/core/auth"
 	"github.com/git-bug/git-bug/cache"
+	"github.com/git-bug/git-bug/entities/bug"
+	"github.com/git-bug/git-bug/entities/common"
 	"github.com/git-bug/git-bug/entity"
 	"github.com/git-bug/git-bug/util/text"
 )
@@ -28,6 +30,9 @@ type githubImporter struct {
 
 	// send only channel
 	out chan<- core.ImportResult
+
+	// maps remote timeline event ID -> matched exported operation entry key
+	matchedExported map[string]string
 }
 
 func (gi *githubImporter) Init(_ context.Context, repo *cache.RepoCache, conf core.Configuration) error {
@@ -52,6 +57,7 @@ func (gi *githubImporter) Init(_ context.Context, repo *cache.RepoCache, conf co
 // missing issues / timeline items / edits / label events ...
 func (gi *githubImporter) ImportAll(ctx context.Context, repo *cache.RepoCache, since time.Time) (<-chan core.ImportResult, error) {
 	gi.mediator = NewImportMediator(ctx, gi.client, gi.conf[confKeyOwner], gi.conf[confKeyProject], since)
+	gi.matchedExported = make(map[string]string)
 	out := make(chan core.ImportResult)
 	gi.out = out
 
@@ -252,9 +258,12 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 		if err == nil {
 			return nil
 		}
-
 		if err != cache.ErrNoMatchingOp {
 			return err
+		}
+		labelName := text.CleanupOneLine(string(item.LabeledEvent.Label.Name))
+		if gi.matchExportedLabelChange(b, id, labelName, true) {
+			return nil
 		}
 		author, err := gi.ensurePerson(ctx, repo, item.LabeledEvent.Actor)
 		if err != nil {
@@ -264,7 +273,7 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 			author,
 			item.LabeledEvent.CreatedAt.Unix(),
 			[]string{
-				text.CleanupOneLine(string(item.LabeledEvent.Label.Name)),
+				labelName,
 			},
 			nil,
 			map[string]string{metaKeyGithubId: id},
@@ -285,6 +294,10 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 		if err != cache.ErrNoMatchingOp {
 			return err
 		}
+		labelName := text.CleanupOneLine(string(item.UnlabeledEvent.Label.Name))
+		if gi.matchExportedLabelChange(b, id, labelName, false) {
+			return nil
+		}
 		author, err := gi.ensurePerson(ctx, repo, item.UnlabeledEvent.Actor)
 		if err != nil {
 			return err
@@ -295,7 +308,7 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 			item.UnlabeledEvent.CreatedAt.Unix(),
 			nil,
 			[]string{
-				text.CleanupOneLine(string(item.UnlabeledEvent.Label.Name)),
+				labelName,
 			},
 			map[string]string{metaKeyGithubId: id},
 		)
@@ -313,6 +326,9 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 			return err
 		}
 		if err == nil {
+			return nil
+		}
+		if gi.matchExportedStatusChange(b, id, common.ClosedStatus) {
 			return nil
 		}
 		author, err := gi.ensurePerson(ctx, repo, item.ClosedEvent.Actor)
@@ -341,6 +357,9 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 		if err == nil {
 			return nil
 		}
+		if gi.matchExportedStatusChange(b, id, common.OpenStatus) {
+			return nil
+		}
 		author, err := gi.ensurePerson(ctx, repo, item.ReopenedEvent.Actor)
 		if err != nil {
 			return err
@@ -367,11 +386,6 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 		if err == nil {
 			return nil
 		}
-		author, err := gi.ensurePerson(ctx, repo, item.RenamedTitleEvent.Actor)
-		if err != nil {
-			return err
-		}
-
 		// At Github there exist issues with seemingly empty titles. An example is
 		// https://github.com/NixOS/nixpkgs/issues/72730 (here the title is actually
 		// a zero width space U+200B).
@@ -379,6 +393,13 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 		title := text.CleanupOneLine(string(item.RenamedTitleEvent.CurrentTitle))
 		if text.Empty(title) {
 			title = EmptyTitlePlaceholder
+		}
+		if gi.matchExportedTitleChange(b, id, title) {
+			return nil
+		}
+		author, err := gi.ensurePerson(ctx, repo, item.RenamedTitleEvent.Actor)
+		if err != nil {
+			return err
 		}
 
 		op, err := b.SetTitleRaw(
@@ -584,4 +605,125 @@ func (gi *githubImporter) getGhost(ctx context.Context, repo *cache.RepoCache) (
 // parseId converts the unusable githubv4.ID (an interface{}) into a string
 func parseId(id githubv4.ID) string {
 	return fmt.Sprintf("%v", id)
+}
+
+func (gi *githubImporter) isOpEntryClaimed(entryKey, eventKey string) bool {
+	if gi.matchedExported == nil {
+		gi.matchedExported = make(map[string]string)
+	}
+	for evKey, key := range gi.matchedExported {
+		if key == entryKey && evKey != eventKey {
+			return true
+		}
+	}
+	return false
+}
+
+func (gi *githubImporter) matchExportedStatusChange(b *cache.BugCache, eventID string, status common.Status) bool {
+	eventKey := fmt.Sprintf("%s:status:%s", b.Id(), eventID)
+	if gi.matchedExported != nil {
+		if _, ok := gi.matchedExported[eventKey]; ok {
+			return true
+		}
+	}
+	snap := b.Snapshot()
+	issueID, ok := snap.GetCreateMetadata(metaKeyGithubId)
+	if !ok {
+		return false
+	}
+	for _, op := range snap.Operations {
+		statusOp, ok := op.(*bug.SetStatusOperation)
+		if !ok || statusOp.Status != status {
+			continue
+		}
+		if id, ok := statusOp.GetMetadata(metaKeyGithubId); !ok || id != issueID {
+			continue
+		}
+		entryKey := statusOp.Id().String()
+		if gi.isOpEntryClaimed(entryKey, eventKey) {
+			continue
+		}
+		gi.matchedExported[eventKey] = entryKey
+		return true
+	}
+	return false
+}
+
+func (gi *githubImporter) matchExportedTitleChange(b *cache.BugCache, eventID, title string) bool {
+	eventKey := fmt.Sprintf("%s:title:%s", b.Id(), eventID)
+	if gi.matchedExported != nil {
+		if _, ok := gi.matchedExported[eventKey]; ok {
+			return true
+		}
+	}
+	snap := b.Snapshot()
+	issueID, ok := snap.GetCreateMetadata(metaKeyGithubId)
+	if !ok {
+		return false
+	}
+	for _, op := range snap.Operations {
+		titleOp, ok := op.(*bug.SetTitleOperation)
+		if !ok || titleOp.Title != title {
+			continue
+		}
+		if id, ok := titleOp.GetMetadata(metaKeyGithubId); !ok || id != issueID {
+			continue
+		}
+		entryKey := titleOp.Id().String()
+		if gi.isOpEntryClaimed(entryKey, eventKey) {
+			continue
+		}
+		gi.matchedExported[eventKey] = entryKey
+		return true
+	}
+	return false
+}
+
+func (gi *githubImporter) matchExportedLabelChange(b *cache.BugCache, eventID, label string, added bool) bool {
+	eventKey := fmt.Sprintf("%s:label:%s", b.Id(), eventID)
+	if gi.matchedExported != nil {
+		if _, ok := gi.matchedExported[eventKey]; ok {
+			return true
+		}
+	}
+	snap := b.Snapshot()
+	issueID, ok := snap.GetCreateMetadata(metaKeyGithubId)
+	if !ok {
+		return false
+	}
+	for _, op := range snap.Operations {
+		labelOp, ok := op.(*bug.LabelChangeOperation)
+		if !ok {
+			continue
+		}
+		if id, ok := labelOp.GetMetadata(metaKeyGithubId); !ok || id != issueID {
+			continue
+		}
+		hasLabel := false
+		if added {
+			for _, l := range labelOp.Added {
+				if string(l) == label {
+					hasLabel = true
+					break
+				}
+			}
+		} else {
+			for _, l := range labelOp.Removed {
+				if string(l) == label {
+					hasLabel = true
+					break
+				}
+			}
+		}
+		if !hasLabel {
+			continue
+		}
+		entryKey := fmt.Sprintf("%s:%t:%s", labelOp.Id().String(), added, label)
+		if gi.isOpEntryClaimed(entryKey, eventKey) {
+			continue
+		}
+		gi.matchedExported[eventKey] = entryKey
+		return true
+	}
+	return false
 }
