@@ -159,7 +159,13 @@ func (gi *gitlabImporter) ensureIssue(ctx context.Context, repo *cache.RepoCache
 }
 
 func (gi *gitlabImporter) ensureIssueEvent(ctx context.Context, repo *cache.RepoCache, b *cache.BugCache, issue *gitlab.Issue, event Event) error {
-	id, errResolve := b.ResolveOperationWithMetadata(metaKeyGitlabId, event.ID())
+	var id entity.Id
+	var errResolve error
+	if event.Kind() == EventComment {
+		id, errResolve = resolveCommentTargetWithMetadata(b, metaKeyGitlabId, event.ID())
+	} else {
+		id, errResolve = b.ResolveOperationWithMetadata(metaKeyGitlabId, event.ID())
+	}
 	if errResolve != nil && errResolve != cache.ErrNoMatchingOp {
 		return errResolve
 	}
@@ -397,6 +403,25 @@ func (gi *gitlabImporter) ensurePerson(ctx context.Context, repo *cache.RepoCach
 
 	gi.out <- core.NewImportIdentity(i.Id())
 	return i, nil
+}
+
+func resolveCommentTargetWithMetadata(b *cache.BugCache, key, value string) (entity.Id, error) {
+	matching := make([]entity.Id, 0, 1)
+	for _, op := range b.Snapshot().AllOperations() {
+		switch op.(type) {
+		case *bug.CreateOperation, *bug.AddCommentOperation:
+			if opVal, ok := op.GetMetadata(key); ok && opVal == value {
+				matching = append(matching, op.Id())
+			}
+		}
+	}
+	if len(matching) == 0 {
+		return "", cache.ErrNoMatchingOp
+	}
+	if len(matching) > 1 {
+		return "", entity.NewErrMultipleMatch("operation", matching)
+	}
+	return matching[0], nil
 }
 
 func (gi *gitlabImporter) isOpEntryClaimed(entryKey, eventKey string) bool {

@@ -109,16 +109,21 @@ func (gi *githubImporter) ImportAll(ctx context.Context, repo *cache.RepoCache, 
 				if err != nil {
 					err := fmt.Errorf("issue creation: %v", err)
 					out <- core.NewImportError(err, "")
-					return
+					currBug = nil
 				}
 			case IssueEditEvent:
+				if currBug == nil {
+					continue
+				}
 				err = gi.ensureIssueEdit(ctx, repo, currBug, event.issueId, &event.userContentEdit)
 				if err != nil {
 					err = fmt.Errorf("issue edit: %v", err)
 					out <- core.NewImportError(err, "")
-					return
 				}
 			case TimelineEvent:
+				if currBug == nil {
+					continue
+				}
 				if next, ok := nextEvent.(CommentEditEvent); ok && event.Typename == "IssueComment" {
 					// consuming and using next event
 					nextEvent = nil
@@ -129,14 +134,15 @@ func (gi *githubImporter) ImportAll(ctx context.Context, repo *cache.RepoCache, 
 				if err != nil {
 					err = fmt.Errorf("timeline item creation: %v", err)
 					out <- core.NewImportError(err, "")
-					return
 				}
 			case CommentEditEvent:
+				if currBug == nil {
+					continue
+				}
 				err = gi.ensureCommentEdit(ctx, repo, currBug, event.commentId, &event.userContentEdit)
 				if err != nil {
 					err = fmt.Errorf("comment edit: %v", err)
 					out <- core.NewImportError(err, "")
-					return
 				}
 			default:
 				panic("Unknown event type")
@@ -420,13 +426,16 @@ func (gi *githubImporter) ensureTimelineItem(ctx context.Context, repo *cache.Re
 }
 
 func (gi *githubImporter) ensureCommentEdit(ctx context.Context, repo *cache.RepoCache, b *cache.BugCache, ghTargetId githubv4.ID, edit *userContentEdit) error {
-	// find comment
-	target, err := b.ResolveOperationWithMetadata(metaKeyGithubId, parseId(ghTargetId))
+	// find comment target only among CreateOperation and AddCommentOperation,
+	// because exported LabelChange/SetStatus/SetTitle/EditComment operations
+	// also carry metaKeyGithubId == issueID.
+	target, err := resolveCommentTargetWithMetadata(b, metaKeyGithubId, parseId(ghTargetId))
 	if err != nil {
 		return err
 	}
+	editID := parseId(edit.Id)
 	// check if the comment edition already exist
-	_, err = b.ResolveOperationWithMetadata(metaKeyGithubId, parseId(edit.Id))
+	_, err = b.ResolveOperationWithMetadata(metaKeyGithubId, editID)
 	if err == nil {
 		return nil
 	}
@@ -435,14 +444,19 @@ func (gi *githubImporter) ensureCommentEdit(ctx context.Context, repo *cache.Rep
 		return err
 	}
 
-	editor, err := gi.ensurePerson(ctx, repo, edit.Editor)
-	if err != nil {
-		return err
-	}
-
 	if edit.DeletedAt != nil {
 		// comment deletion, not supported yet
 		return nil
+	}
+
+	cleanMsg := text.Cleanup(string(*edit.Diff))
+	if gi.matchExportedCommentEdit(b, editID, target, cleanMsg) {
+		return nil
+	}
+
+	editor, err := gi.ensurePerson(ctx, repo, edit.Editor)
+	if err != nil {
+		return err
 	}
 
 	commentId := entity.CombineIds(b.Id(), target)
@@ -452,9 +466,9 @@ func (gi *githubImporter) ensureCommentEdit(ctx context.Context, repo *cache.Rep
 		editor,
 		edit.CreatedAt.Unix(),
 		commentId,
-		text.Cleanup(string(*edit.Diff)),
+		cleanMsg,
 		map[string]string{
-			metaKeyGithubId: parseId(edit.Id),
+			metaKeyGithubId: editID,
 		},
 	)
 
@@ -472,7 +486,7 @@ func (gi *githubImporter) ensureComment(ctx context.Context, repo *cache.RepoCac
 		return err
 	}
 
-	_, err = b.ResolveOperationWithMetadata(metaKeyGithubId, parseId(comment.Id))
+	_, err = resolveCommentTargetWithMetadata(b, metaKeyGithubId, parseId(comment.Id))
 	if err == nil {
 		return nil
 	}
@@ -605,6 +619,61 @@ func (gi *githubImporter) getGhost(ctx context.Context, repo *cache.RepoCache) (
 // parseId converts the unusable githubv4.ID (an interface{}) into a string
 func parseId(id githubv4.ID) string {
 	return fmt.Sprintf("%v", id)
+}
+
+func resolveCommentTargetWithMetadata(b *cache.BugCache, key, value string) (entity.Id, error) {
+	matching := make([]entity.Id, 0, 1)
+	for _, op := range b.Snapshot().AllOperations() {
+		switch op.(type) {
+		case *bug.CreateOperation, *bug.AddCommentOperation:
+			if opVal, ok := op.GetMetadata(key); ok && opVal == value {
+				matching = append(matching, op.Id())
+			}
+		}
+	}
+	if len(matching) == 0 {
+		return "", cache.ErrNoMatchingOp
+	}
+	if len(matching) > 1 {
+		return "", entity.NewErrMultipleMatch("operation", matching)
+	}
+	return matching[0], nil
+}
+
+func (gi *githubImporter) matchExportedCommentEdit(b *cache.BugCache, eventID string, target entity.Id, message string) bool {
+	eventKey := fmt.Sprintf("%s:edit:%s", b.Id(), eventID)
+	if gi.matchedExported != nil {
+		if _, ok := gi.matchedExported[eventKey]; ok {
+			return true
+		}
+	}
+	snap := b.Snapshot()
+	var targetRemoteID string
+	for _, op := range snap.Operations {
+		if op.Id() == target {
+			targetRemoteID, _ = op.GetMetadata(metaKeyGithubId)
+			break
+		}
+	}
+	if targetRemoteID == "" {
+		return false
+	}
+	for _, op := range snap.Operations {
+		editOp, ok := op.(*bug.EditCommentOperation)
+		if !ok || editOp.Target != target || editOp.Message != message {
+			continue
+		}
+		if id, ok := editOp.GetMetadata(metaKeyGithubId); !ok || id != targetRemoteID {
+			continue
+		}
+		entryKey := editOp.Id().String()
+		if gi.isOpEntryClaimed(entryKey, eventKey) {
+			continue
+		}
+		gi.matchedExported[eventKey] = entryKey
+		return true
+	}
+	return false
 }
 
 func (gi *githubImporter) isOpEntryClaimed(entryKey, eventKey string) bool {

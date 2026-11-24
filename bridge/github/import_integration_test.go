@@ -16,6 +16,7 @@ import (
 	"github.com/git-bug/git-bug/cache"
 	"github.com/git-bug/git-bug/entities/bug"
 	"github.com/git-bug/git-bug/entities/common"
+	"github.com/git-bug/git-bug/entity"
 	"github.com/git-bug/git-bug/entity/dag"
 	"github.com/git-bug/git-bug/repository/repotest"
 )
@@ -607,4 +608,70 @@ func TestGithubImporterDeduplicateExportedOps(t *testing.T) {
 		require.NoError(t, importer.ensureTimelineItem(ctx, backend, b, item))
 	}
 	require.Equal(t, initialNonMetaOps+4, countNonMetadataOps(b))
+
+	// 4. Verify ensureIssueEdit and ensureCommentEdit work when multiple exported operations
+	// share metaKeyGithubId == issueGithubID (no "Multiple matching operation found" error),
+	// and deduplicate exported EditCommentOperation echoes while importing new remote edits.
+	editIssueOp, err := b.EditCommentRaw(
+		author,
+		105,
+		entity.CombineIds(b.Id(), createOp.Id()),
+		"edited body from git-bug",
+		nil,
+	)
+	require.NoError(t, err)
+	require.NoError(t, markOperationAsExported(ctx, b, editIssueOp.Id(), issueGithubID, issueGithubURL))
+
+	commentCombinedID, commentOp, err := b.AddCommentRaw(author, 106, "comment 1", nil, nil)
+	require.NoError(t, err)
+	const commentGithubID = "comment-1"
+	const commentGithubURL = "https://github.com/marcus/to-himself/issues/1#issuecomment-1"
+	require.NoError(t, markOperationAsExported(ctx, b, commentOp.Id(), commentGithubID, commentGithubURL))
+
+	editCommentOp, err := b.EditCommentRaw(author, 107, commentCombinedID, "comment 1 edited from git-bug", nil)
+	require.NoError(t, err)
+	require.NoError(t, markOperationAsExported(ctx, b, editCommentOp.Id(), commentGithubID, commentGithubURL))
+
+	opsBeforeEdits := countNonMetadataOps(b)
+
+	// Echoed comment creation, issue body edit, and comment edit from git-bug export must be skipped
+	require.NoError(t, importer.ensureTimelineItem(ctx, backend, b, &timelineItem{
+		Typename: "IssueComment",
+		IssueComment: issueComment{
+			authorEvent: authorEvent{Id: commentGithubID, Author: actorMarcus},
+			Body:        "comment 1 edited from git-bug",
+		},
+	}))
+	echoedIssueBody := githubv4.String("edited body from git-bug")
+	require.NoError(t, importer.ensureIssueEdit(ctx, backend, b, issueGithubID, &userContentEdit{
+		Id:     "uce-issue-1",
+		Editor: actorMarcus,
+		Diff:   &echoedIssueBody,
+	}))
+	echoedCommentBody := githubv4.String("comment 1 edited from git-bug")
+	require.NoError(t, importer.ensureCommentEdit(ctx, backend, b, commentGithubID, &userContentEdit{
+		Id:     "uce-comment-1",
+		Editor: actorMarcus,
+		Diff:   &echoedCommentBody,
+	}))
+	require.Equal(t, opsBeforeEdits, countNonMetadataOps(b))
+
+	// Legitimate remote issue body edit and comment edit must be imported without "Multiple matching operation found"
+	remoteIssueBody := githubv4.String("edited body on github")
+	require.NoError(t, importer.ensureIssueEdit(ctx, backend, b, issueGithubID, &userContentEdit{
+		Id:     "uce-issue-2",
+		Editor: actorMarcus,
+		Diff:   &remoteIssueBody,
+	}))
+	require.Equal(t, opsBeforeEdits+1, countNonMetadataOps(b))
+	require.Equal(t, "edited body on github", b.Snapshot().Comments[0].Message)
+
+	remoteCommentBody := githubv4.String("comment 1 edited on github")
+	require.NoError(t, importer.ensureCommentEdit(ctx, backend, b, commentGithubID, &userContentEdit{
+		Id:     "uce-comment-2",
+		Editor: actorMarcus,
+		Diff:   &remoteCommentBody,
+	}))
+	require.Equal(t, opsBeforeEdits+2, countNonMetadataOps(b))
+	require.Equal(t, "comment 1 edited on github", b.Snapshot().Comments[1].Message)
 }

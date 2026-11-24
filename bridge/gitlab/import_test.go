@@ -371,4 +371,26 @@ func TestGitlabImporterCrossBridgeAndDeduplicateExportedOps(t *testing.T) {
 		require.NoError(t, importer.ensureIssueEvent(ctx, backend, b, glIssue, ev))
 	}
 	require.Equal(t, initialNonMetaOps+4, countNonMetadataOps(b))
+
+	// 5. Verify EventComment does not fail with "Multiple matching operation found" when
+	// both AddCommentOperation and an exported EditCommentOperation share metaKeyGitlabId == noteID.
+	commentCombinedID, commentOp, err := b.AddCommentRaw(author, 105, "comment 1", nil, nil)
+	require.NoError(t, err)
+	const noteGitlabID = "555"
+	require.NoError(t, markOperationAsExported(ctx, b, commentOp.Id(), noteGitlabID, ""))
+
+	editCommentOp, err := b.EditCommentRaw(author, 106, commentCombinedID, "comment 1 edited", nil)
+	require.NoError(t, err)
+	require.NoError(t, markOperationAsExported(ctx, b, editCommentOp.Id(), noteGitlabID, ""))
+
+	opsAfterLocalCommentEdit := countNonMetadataOps(b)
+	var commentNote gitlab.Note
+	commentNote.ID = 555
+	commentNote.System = false
+	commentNote.Body = "comment 1 edited"
+	commentNote.CreatedAt = &now
+	commentNote.UpdatedAt = &now
+	commentNote.Author.ID = 42
+	require.NoError(t, importer.ensureIssueEvent(ctx, backend, b, glIssue, NoteEvent{commentNote}))
+	require.Equal(t, opsAfterLocalCommentEdit, countNonMetadataOps(b))
 }
