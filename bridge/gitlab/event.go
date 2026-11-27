@@ -53,14 +53,11 @@ func (n NoteEvent) UserID() int64        { return n.Author.ID }
 func (n NoteEvent) CreatedAt() time.Time { return *n.Note.CreatedAt }
 
 func (n NoteEvent) Kind() EventKind {
-	if _, err := parser.NewWithInput(parser.TitleParser, n.Body).Parse(); err == nil {
-		return EventTitleChanged
+	if !n.System {
+		return EventComment
 	}
 
 	switch {
-	case !n.System:
-		return EventComment
-
 	case n.Body == "closed":
 		return EventClosed
 
@@ -104,6 +101,9 @@ func (n NoteEvent) Kind() EventKind {
 		return EventMentionedInCommit
 
 	default:
+		if _, err := parser.NewWithInput(parser.TitleParser, n.Body).Parse(); err == nil {
+			return EventTitleChanged
+		}
 		return EventUnknown
 	}
 

@@ -394,3 +394,102 @@ func TestGitlabImporterCrossBridgeAndDeduplicateExportedOps(t *testing.T) {
 	require.NoError(t, importer.ensureIssueEvent(ctx, backend, b, glIssue, NoteEvent{commentNote}))
 	require.Equal(t, opsAfterLocalCommentEdit, countNonMetadataOps(b))
 }
+
+func TestGitlabImporterNonSystemCommentWithBoldAfterTo(t *testing.T) {
+	repo := repotest.NewGoGitRepo(t, false)
+	backend, err := cache.NewRepoCacheNoEvents(repo, nil)
+	require.NoError(t, err)
+	defer func() { _ = backend.Close() }()
+
+	ctx := context.Background()
+	author, err := backend.Identities().NewRaw(ctx, "Test User", "test@example.com", "testuser", "", nil, map[string]string{
+		metaKeyGitlabId:    "42",
+		metaKeyGitlabLogin: "testuser",
+	})
+	require.NoError(t, err)
+	require.NoError(t, backend.SetUserIdentity(ctx, author))
+
+	const initialTitle = "Original Issue Title"
+	const issueGitlabURL = "https://gitlab.com/git-bug/test/-/issues/8"
+	const projectID = "12345"
+
+	b, _, err := backend.Bugs().NewRaw(
+		author,
+		100,
+		initialTitle,
+		"initial description",
+		nil,
+		map[string]string{
+			core.MetaKeyOrigin:   target,
+			metaKeyGitlabId:      "8",
+			metaKeyGitlabUrl:     issueGitlabURL,
+			metaKeyGitlabProject: projectID,
+			metaKeyGitlabBaseUrl: defaultBaseURL,
+		},
+	)
+	require.NoError(t, err)
+
+	out := make(chan core.ImportResult, 32)
+	importer := &gitlabImporter{
+		conf: core.Configuration{
+			confKeyProjectID:     projectID,
+			confKeyGitlabBaseUrl: defaultBaseURL,
+		},
+		out: out,
+	}
+
+	now := time.Unix(200, 0)
+	glIssue := &gitlab.Issue{
+		IID:         8,
+		Title:       initialTitle,
+		Description: "initial description",
+		WebURL:      issueGitlabURL,
+		CreatedAt:   &now,
+		Author:      &gitlab.IssueAuthor{ID: 42},
+	}
+
+	commentBodies := []string{
+		"Sample down to **10% – 20% of the total number of examples**. Large datasets are defined as **10M+ examples**.",
+		"Faster when switched to **Distributed Streaming MPP** under `ANALYTICS_REGULAR`!",
+		"Causes launcher to **ignore the user's `PATH`**",
+		"changed title from **old** to **new**",
+	}
+
+	for i, body := range commentBodies {
+		var note gitlab.Note
+		note.ID = int64(1000 + i)
+		note.System = false
+		note.Body = body
+		note.CreatedAt = &now
+		note.UpdatedAt = &now
+		note.Author.ID = 42
+
+		require.NoError(t, importer.ensureIssueEvent(ctx, backend, b, glIssue, NoteEvent{note}))
+	}
+
+	snap := b.Snapshot()
+	require.Equal(t, initialTitle, snap.Title)
+
+	var importedComments []string
+	for _, op := range snap.Operations {
+		switch o := op.(type) {
+		case *bug.SetTitleOperation:
+			t.Fatalf("unexpected SetTitleOperation emitted: %+v", o)
+		case *bug.AddCommentOperation:
+			importedComments = append(importedComments, o.Message)
+		}
+	}
+	require.Equal(t, commentBodies, importedComments)
+
+	// Verify a genuine system title-change note still emits SetTitleOperation.
+	var sysTitleNote gitlab.Note
+	sysTitleNote.ID = 2000
+	sysTitleNote.System = true
+	sysTitleNote.Body = "changed title from **Original Issue Title** to **Updated Issue Title**"
+	sysTitleNote.CreatedAt = &now
+	sysTitleNote.UpdatedAt = &now
+	sysTitleNote.Author.ID = 42
+
+	require.NoError(t, importer.ensureIssueEvent(ctx, backend, b, glIssue, NoteEvent{sysTitleNote}))
+	require.Equal(t, "Updated Issue Title", b.Snapshot().Title)
+}
