@@ -108,6 +108,42 @@ func TestTitleParser(t *testing.T) {
 				title: "this may be an amazing bug",
 			},
 		},
+		{
+			name: "title containing bold markers (markdown)",
+			args: args{
+				diff: `changed title from **old** to **new **bold** title**`,
+			},
+			want: want{
+				title: "new **bold** title",
+			},
+		},
+		{
+			name: "old and new titles containing bold markers (markdown)",
+			args: args{
+				diff: `changed title from **foo **bar**** to **foo **baz****`,
+			},
+			want: want{
+				title: "foo **baz**",
+			},
+		},
+		{
+			name: "title containing word to (markdown)",
+			args: args{
+				diff: `changed title from **a to b** to **a to c**`,
+			},
+			want: want{
+				title: "a to c",
+			},
+		},
+		{
+			name: "html without paragraph wrapper",
+			args: args{
+				diff: `changed title from <code class="idiff">old title</code> to <code class="idiff">new title</code>`,
+			},
+			want: want{
+				title: "new title",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -117,6 +153,54 @@ func TestTitleParser(t *testing.T) {
 				t.Error(err)
 			}
 			assert.Equal(t, tt.want.title, title)
+		})
+	}
+}
+
+func TestTitleParserRejectsNonTitleNotes(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "multi-span bold markdown after to",
+			input: "We should sample down to **10% – 20% of the total number of examples**. Large datasets are defined as **10M+ examples** in our benchmark.",
+		},
+		{
+			name:  "single-span bold markdown after to",
+			input: "Query ran much faster when switched to **Distributed Streaming MPP** under `ANALYTICS_REGULAR`!",
+		},
+		{
+			name:  "inline code inside bold after to",
+			input: "This causes the launcher to **ignore the user's `PATH`**",
+		},
+		{
+			name:  "inline code only inside bold after to",
+			input: "On Ubuntu, `fd` is installed as a symlink to **`fdfind`**",
+		},
+		{
+			name:  "numeric range bold after to",
+			input: "Bump memory limit to **512MB or 1GB**",
+		},
+		{
+			name:  "non-title system note with bold after to",
+			input: "changed due date to **2026-12-01**",
+		},
+		{
+			name:  "title change prefix with trailing non-title text",
+			input: "changed title from **old** to **new** and more text",
+		},
+		{
+			name:  "multiline note starting with title change text",
+			input: "changed title from **old** to **new**\nextra line",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			title, err := NewWithInput(TitleParser, tt.input).Parse()
+			assert.Error(t, err)
+			assert.Empty(t, title)
 		})
 	}
 }

@@ -34,6 +34,12 @@ type titleParser struct {
 	input string
 }
 
+var (
+	reTitleHTML = regexp.MustCompile(`^(?:<p>)?changed title from <code\s+class="idiff"\s*>.*?</code> to <code\s+class="idiff"\s*>(.*?)</code>(?:</p>)?$`)
+	reTitleMD   = regexp.MustCompile(`^changed title from \*\*(.+?)\*\* to \*\*(.+)\*\*$`)
+	reTitleDiff = regexp.MustCompile(`{\+(.*?)\+}`)
+)
+
 // Parse is used to fetch the new title from a "changed title" event
 //
 // this func is a great example of something that is _extremely_ fragile; the
@@ -50,35 +56,22 @@ type titleParser struct {
 // [0]: https://github.com/git-bug/git-bug/issues/1367
 // [1]: https://docs.gitlab.com/api/resource_iteration_events/#list-project-issue-iteration-events
 func (p titleParser) Parse() (string, error) {
-	var reHTML = regexp.MustCompile(`.* to <code\s+class="idiff"\s*>(.*?)</code>`)
-	var reMD = regexp.MustCompile(`.* to \*\*(.*)\*\*`)
+	input := strings.TrimSpace(p.input)
 
-	matchHTML := reHTML.FindAllStringSubmatch(p.input, -1)
-	matchMD := reMD.FindAllStringSubmatch(p.input, -1)
-
-	if len(matchHTML) == 1 {
-		t, err := p.stripHTML(matchHTML[0][1])
+	if matchHTML := reTitleHTML.FindStringSubmatch(input); matchHTML != nil {
+		t, err := p.stripHTML(matchHTML[1])
 		if err != nil {
 			return "", fmt.Errorf("unable to strip HTML from new title: %q", t)
 		}
 		return strings.TrimSpace(t), nil
 	}
 
-	if len(matchMD) == 1 {
-		reDiff := regexp.MustCompile(`{\+(.*?)\+}`)
-
-		t := matchMD[0][1]
-		t = reDiff.ReplaceAllString(t, "$1")
-
+	if matchMD := reTitleMD.FindStringSubmatch(input); matchMD != nil {
+		t := reTitleDiff.ReplaceAllString(matchMD[2], "$1")
 		return strings.TrimSpace(t), nil
 	}
 
-	return "", fmt.Errorf(
-		"failed to extract title: html=%d md=%d input=%q",
-		len(matchHTML),
-		len(matchMD),
-		p.input,
-	)
+	return "", fmt.Errorf("failed to extract title: input=%q", p.input)
 }
 
 // stripHTML removes all html tags from a provided string
